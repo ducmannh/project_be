@@ -13,14 +13,18 @@ using Microsoft.IdentityModel.Tokens;
 using WebApplication1.Data;
 using WebApplication1.Entity;
 using WebApplication1.Models;
+using MailKit.Net.Smtp;
+using MimeKit;
 
 namespace WebApplication1.Services
 {
-    public class AuthService(AppDbContext context, IConfiguration configuration) : IAuthService
+    public class AuthService(AppDbContext context, IConfiguration configuration, IEmailService emailService) : IAuthService
     {
-        public async Task<TokenResponseDto?> LoginAsync(UserDto request)
+        // private readonly IEmailService emailService;
+        public async Task<TokenResponseDto?> LoginAsync(LoginDto request)
         {
-            var user = await context.Users.FirstOrDefaultAsync(u => u.Username == request.Username);
+            bool isEmail = request.LoginInput.Contains("@");
+            var user = await context.Users.FirstOrDefaultAsync(u => isEmail ? u.Email == request.LoginInput : u.Username == request.LoginInput);
             if (user is null)
                 return null;
 
@@ -31,9 +35,10 @@ namespace WebApplication1.Services
             return await CreateTokenResponse(user);
         }
 
-        public async Task<User?> RegisterAsync(UserDto request)
+        public async Task<User?> RegisterAsync(RegisterDto request)
         {
-            if (await context.Users.AnyAsync(u => u.Username == request.Username))
+            bool userExists = await context.Users.AnyAsync(u => u.Username == request.Username || u.Email == request.Email);
+            if (userExists)
             {
                 return null;
             }
@@ -43,6 +48,7 @@ namespace WebApplication1.Services
 
             user.Username = request.Username;
             user.PasswordHash = hashedPassword;
+            user.Email = request.Email;
 
             context.Users.Add(user);
             await context.SaveChangesAsync();
@@ -57,6 +63,50 @@ namespace WebApplication1.Services
                 return null;
 
             return await CreateTokenResponse(user);
+        }
+
+        public async Task<bool> ForgotPassword(ForgotPasswordDto request)
+        {
+            var user = await context.Users.FirstOrDefaultAsync(u => u.Email == request.Email);
+            if (user == null)
+            {
+                return true; 
+            }
+
+            var random = new Random();
+            var resetCode = random.Next(100000, 999999).ToString();
+            user.ResetCode = resetCode;
+            user.ResetCodeExpiry = DateTime.UtcNow.AddMinutes(15);
+            await context.SaveChangesAsync();
+
+            await emailService.SendResetCodeEmail(user.Email, resetCode);
+            return true;
+        }
+
+        public async Task<bool> VerifyCode(VerifyCodeDto request)
+        {
+            var user = await context.Users.FirstOrDefaultAsync(u => u.Email == request.Email);
+            if (user == null || user.ResetCode != request.Code || user.ResetCodeExpiry < DateTime.UtcNow)
+            {
+                return false;
+            }
+            return true;
+        }
+
+        public async Task<bool> ResetPassword(ResetPasswordDto request)
+        {
+            var user = await context.Users.FirstOrDefaultAsync(u => u.Email == request.Email);
+            if (user == null || string.IsNullOrEmpty(user.ResetCode))
+            {
+                return false;
+            }
+            var hashedPassword = new PasswordHasher<User>().HashPassword(user, request.NewPassword);
+
+            user.PasswordHash = hashedPassword;
+            user.ResetCode = null;
+            user.ResetCodeExpiry = null;
+            await context.SaveChangesAsync();
+            return true;
         }
 
         private async Task<TokenResponseDto> CreateTokenResponse(User user)
@@ -98,8 +148,9 @@ namespace WebApplication1.Services
         {
             var claims = new List<Claim> {
                 new Claim(ClaimTypes.Name, user.Username),
-                new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
-                new Claim(ClaimTypes.Role, user.Role)
+                new Claim(ClaimTypes.Email, user.Email),
+                // new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
+                // new Claim(ClaimTypes.Role, user.Role)
             };
             var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(configuration.GetValue<string>("AppSettings:Token")!));
             var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
